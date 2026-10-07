@@ -1273,10 +1273,52 @@ struct LogicalOutputCell {
     xdg_output: Option<ZxdgOutputV1>,
     mode_width: u32,
     mode_height: u32,
+    transform: Option<wl_output::Transform>,
     logical_x: Option<i32>,
     logical_y: Option<i32>,
     logical_width: Option<u32>,
     logical_height: Option<u32>,
+}
+
+impl LogicalOutputCell {
+    fn update(&mut self, event: wl_output::Event) {
+        match event {
+            wl_output::Event::Geometry { transform, .. } => {
+                self.transform = transform.into_result().ok();
+            }
+            wl_output::Event::Mode {
+                flags: WEnum::Value(flags),
+                width,
+                height,
+                ..
+            } if flags.contains(wl_output::Mode::Current) => {
+                // Preferred and available modes need not be the active mode.
+                // Replace it on changes, including changes to a smaller mode.
+                self.mode_width = width.max(0) as u32;
+                self.mode_height = height.max(0) as u32;
+            }
+            _ => {}
+        }
+    }
+
+    fn backing_dimensions(&self) -> (u32, u32) {
+        match self.transform {
+            Some(
+                wl_output::Transform::_90
+                | wl_output::Transform::_270
+                | wl_output::Transform::Flipped90
+                | wl_output::Transform::Flipped270,
+            ) => (self.mode_height, self.mode_width),
+            Some(
+                wl_output::Transform::Normal
+                | wl_output::Transform::_180
+                | wl_output::Transform::Flipped
+                | wl_output::Transform::Flipped180,
+            ) => (self.mode_width, self.mode_height),
+            // Do not invent a backing frame before geometry is known.
+            _ => (0, 0),
+        }
+    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for LogicalOutputQuery {
@@ -1319,14 +1361,8 @@ impl Dispatch<WlOutput, usize> for LogicalOutputQuery {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // `wl_output` mode is the hardware (backing-pixel) mode; the logical
-        // size arrives separately below. Keep the largest advertised mode so
-        // a preferred-mode announcement never shrinks the backing extent.
-        if let wl_output::Event::Mode { width, height, .. } = event {
-            if let Some(cell) = state.outputs.get_mut(*index) {
-                cell.mode_width = cell.mode_width.max(width.max(0) as u32);
-                cell.mode_height = cell.mode_height.max(height.max(0) as u32);
-            }
+        if let Some(cell) = state.outputs.get_mut(*index) {
+            cell.update(event);
         }
     }
 }
@@ -1406,7 +1442,7 @@ fn query_logical_outputs() -> anyhow::Result<(Vec<LogicalOutput>, Vec<(u32, u32)
     let modes = state
         .outputs
         .iter()
-        .map(|cell| (cell.mode_width, cell.mode_height))
+        .map(LogicalOutputCell::backing_dimensions)
         .collect();
     tracing::debug!(
         outputs = state.outputs.len(),
@@ -4260,8 +4296,79 @@ mod tests {
 mod logical_frame_tests {
     use super::{
         crop_backing_png_to_logical_rect, crop_png_to_rect, logical_desktop, logical_desktop_frame,
-        single_logical_output, uniform_backing_scale, LogicalOutput,
+        single_logical_output, uniform_backing_scale, wl_output, LogicalOutput, LogicalOutputCell,
+        WEnum,
     };
+
+    fn geometry(transform: WEnum<wl_output::Transform>) -> wl_output::Event {
+        wl_output::Event::Geometry {
+            x: 0,
+            y: 0,
+            physical_width: 0,
+            physical_height: 0,
+            subpixel: WEnum::Value(wl_output::Subpixel::Unknown),
+            make: String::new(),
+            model: String::new(),
+            transform,
+        }
+    }
+
+    fn mode(flags: wl_output::Mode, width: i32, height: i32) -> wl_output::Event {
+        wl_output::Event::Mode {
+            flags: WEnum::Value(flags),
+            width,
+            height,
+            refresh: 60_000,
+        }
+    }
+
+    #[test]
+    fn current_mode_ignores_preferred_and_replaces_previous_current() {
+        let mut cell = LogicalOutputCell::default();
+        cell.update(geometry(WEnum::Value(wl_output::Transform::Normal)));
+        cell.update(mode(wl_output::Mode::Preferred, 3_840, 2_160));
+        cell.update(mode(wl_output::Mode::Current, 1_920, 1_080));
+        cell.update(mode(wl_output::Mode::Preferred, 3_840, 2_160));
+
+        let (width, height) = cell.backing_dimensions();
+        assert_eq!((width, height), (1_920, 1_080));
+        assert_eq!(uniform_backing_scale(width, height, 1_280, 720), Some(1.5));
+
+        cell.update(mode(wl_output::Mode::Current, 1_280, 720));
+        assert_eq!(cell.backing_dimensions(), (1_280, 720));
+    }
+
+    #[test]
+    fn output_transform_maps_the_current_mode_into_logical_orientation() {
+        for (transform, expected) in [
+            (wl_output::Transform::Normal, (1_920, 1_080)),
+            (wl_output::Transform::_90, (1_080, 1_920)),
+            (wl_output::Transform::_180, (1_920, 1_080)),
+            (wl_output::Transform::_270, (1_080, 1_920)),
+            (wl_output::Transform::Flipped, (1_920, 1_080)),
+            (wl_output::Transform::Flipped90, (1_080, 1_920)),
+            (wl_output::Transform::Flipped180, (1_920, 1_080)),
+            (wl_output::Transform::Flipped270, (1_080, 1_920)),
+        ] {
+            let mut cell = LogicalOutputCell::default();
+            cell.update(mode(wl_output::Mode::Current, 1_920, 1_080));
+            assert_eq!(cell.backing_dimensions(), (0, 0));
+            cell.update(geometry(WEnum::Value(transform)));
+            assert_eq!(cell.backing_dimensions(), expected);
+            assert_eq!(
+                uniform_backing_scale(
+                    expected.0,
+                    expected.1,
+                    expected.0 * 2 / 3,
+                    expected.1 * 2 / 3
+                ),
+                Some(1.5)
+            );
+
+            cell.update(geometry(WEnum::Unknown(u32::MAX)));
+            assert_eq!(cell.backing_dimensions(), (0, 0));
+        }
+    }
 
     fn output(x: i32, y: i32, width: u32, height: u32) -> LogicalOutput {
         LogicalOutput {
